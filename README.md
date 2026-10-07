@@ -16,3 +16,9 @@
 ```sh
 pio run
 ```
+
+## Результат роботи
+
+Вивід Serial Monitor із часом ввімкнення (`ON`), вимкнення (`OFF`) реле та середніми значеннями (`AVG ON`, `AVG OFF`) у мікросекундах.
+
+![Вимірювання часу спрацювання реле в Serial Monitor](docs/images/relay-timing-serial-monitor.jpg)
