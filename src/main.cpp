@@ -1,405 +1,247 @@
 #include <Arduino.h>
 
-// ==========================================
-// КОНФІГУРАЦІЯ
-// ==========================================
+const int RELAY_CONTROL_PIN = 4;
+const int RELAY_CONTACT_PIN = 6;
 
-// Всі параметри програми винесені в одну структуру.
-// static constexpr означає, що:
-// 1. Не потрібно створювати об'єкт Config.
-// 2. Значення відомі ще під час компіляції.
-// 3. У коді немає "магічних чисел".
-struct Config
-{
-    static constexpr uint8_t LED_PIN = 5;
-    static constexpr uint8_t BUTTON_PIN = 16;
+const unsigned long PAUSE_MS = 1000;
+const unsigned long TIMEOUT_MS = 100;
+const unsigned long DEBOUNCE_US = 5000;
 
-    // Інтервал перемикання LED під час блимання
-    static constexpr uint32_t BLINK_INTERVAL_MS = 500;
+const int RELAY_ON = HIGH;
+const int RELAY_OFF = LOW;
 
-    // Час антидребезгу кнопки
-    static constexpr uint32_t DEBOUNCE_MS = 50;
 
-    // Швидкість Serial Monitor
-    static constexpr uint32_t SERIAL_BAUD = 115200;
+// Дані з interrupt
+volatile bool edgeDetected = false;
+volatile unsigned long lastEdgeTime = 0;
 
-    // Як часто виводити статистику superloop
-    static constexpr uint32_t STATS_INTERVAL_MS = 2000;
+
+// Стани
+enum State {
+  WAIT_BEFORE_ON,
+  WAIT_FOR_ON,
+  WAIT_BEFORE_OFF,
+  WAIT_FOR_OFF
 };
 
-// ==========================================
-// СТАН LED
-// ==========================================
+State state = WAIT_BEFORE_ON;
 
-enum class LedState
-{
-    Off,
-    On
-};
+unsigned long stateStartMs = 0;
+unsigned long commandStartUs = 0;
 
-// ==========================================
-// РЕЖИМ РОБОТИ LED
-// ==========================================
+unsigned long onTime = 0;
 
-enum class LedMode
-{
-    Blinking,
-    AlwaysOn,
-    AlwaysOff
-};
+unsigned long measurementCount = 0;
 
-// ==========================================
-// КЛАС LED
-// ==========================================
+uint64_t totalOnTime = 0;
+uint64_t totalOffTime = 0;
 
-class Led
-{
-public:
-    // Конструктор отримує номер GPIO.
-    explicit Led(uint8_t pin)
-        : pin_(pin)
-    {
-    }
 
-    // Ініціалізація LED
-    void init()
-    {
-        pinMode(pin_, OUTPUT);
+// =====================================================
+// INTERRUPT
+// =====================================================
 
-        // Після запуску LED вимкнений
-        set(LedState::Off);
-    }
-
-    // Встановлення стану LED
-    void set(LedState state)
-    {
-        if (state == LedState::On)
-        {
-            digitalWrite(pin_, HIGH);
-        }
-        else
-        {
-            digitalWrite(pin_, LOW);
-        }
-    }
-
-private:
-    // Пін після створення об'єкта не змінюється
-    const uint8_t pin_;
-};
-
-// ==========================================
-// ОТРИМАННЯ ОБ'ЄКТА LED
-// ==========================================
-
-// static локальний об'єкт створюється тільки один раз
-// і живе до кінця роботи програми.
-//
-// Так ми уникаємо зайвої глобальної змінної.
-Led &getLed()
-{
-    static Led led(Config::LED_PIN);
-
-    return led;
+void IRAM_ATTR contactISR() {
+  lastEdgeTime = micros();
+  edgeDetected = true;
 }
 
-// ==========================================
-// ЗМІННА ДЛЯ ISR
-// ==========================================
 
-// volatile потрібен, оскільки ця змінна
-// змінюється асинхронно у функції переривання.
-//
-// ISR виставляє true,
-// а loop() потім обробляє подію.
-volatile bool buttonPressed = false;
+// =====================================================
+// Перевірка контакту після debounce
+// =====================================================
 
-// ==========================================
-// ISR КНОПКИ
-// ==========================================
+bool contactReady(int expectedLevel, unsigned long &time) {
 
-// Interrupt Service Routine повинна бути
-// максимально короткою.
-//
-// Тут НЕ робимо:
-// Serial.print()
-// delay()
-// debounce
-// зміну режимів
-//
-// Тільки встановлюємо прапорець.
-void IRAM_ATTR buttonISR()
-{
-    buttonPressed = true;
+  if (!edgeDetected) {
+    return false;
+  }
+
+  unsigned long edge;
+
+  noInterrupts();
+  edge = lastEdgeTime;
+  interrupts();
+
+  // Чекаємо, поки брязкіт закінчиться
+  if (micros() - edge < DEBOUNCE_US) {
+    return false;
+  }
+
+  // Перевіряємо реальний стан контакту
+  if (digitalRead(RELAY_CONTACT_PIN) != expectedLevel) {
+    return false;
+  }
+
+  edgeDetected = false;
+
+  time = edge;
+
+  return true;
 }
 
-// ==========================================
+
+// =====================================================
 // SETUP
-// ==========================================
+// =====================================================
 
-void setup()
-{
-    // ------------------------------------------
-    // SERIAL
-    // ------------------------------------------
+void setup() {
 
-    Serial.begin(Config::SERIAL_BAUD);
+  Serial.begin(115200);
 
-    // ------------------------------------------
-    // LED
-    // ------------------------------------------
+  pinMode(RELAY_CONTROL_PIN, OUTPUT);
 
-    getLed().init();
+  // COM -> GND
+  // NO  -> GPIO6
+  pinMode(RELAY_CONTACT_PIN, INPUT_PULLUP);
 
-    // ------------------------------------------
-    // BUTTON
-    // ------------------------------------------
+  digitalWrite(RELAY_CONTROL_PIN, RELAY_OFF);
 
-    // Кнопка підключена:
-    //
-    // GPIO 16 ---- BUTTON ---- GND
-    //
-    // Використовуємо внутрішній pull-up.
-    //
-    // Кнопка НЕ натиснута:
-    // GPIO = HIGH
-    //
-    // Кнопка натиснута:
-    // GPIO = LOW
-    pinMode(Config::BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(
+    digitalPinToInterrupt(RELAY_CONTACT_PIN),
+    contactISR,
+    CHANGE
+  );
 
-    // При натисканні сигнал переходить
-    // HIGH -> LOW.
-    //
-    // Тому використовуємо FALLING.
-    attachInterrupt(
-        digitalPinToInterrupt(Config::BUTTON_PIN),
-        buttonISR,
-        FALLING);
+  stateStartMs = millis();
 
-    // ------------------------------------------
-    // START MESSAGE
-    // ------------------------------------------
-
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("Embedded C++ LED Superloop");
-    Serial.println("================================");
-    Serial.println("Initial mode: BLINKING");
-    Serial.println();
+  Serial.println("Relay test started");
 }
 
-// ==========================================
-// LOOP / SUPERLOOP
-// ==========================================
 
-void loop()
-{
-    // ==========================================
-    // ПОЧАТОК ВИМІРЮВАННЯ SUPERLOOP
-    // ==========================================
+// =====================================================
+// LOOP
+// =====================================================
 
-    // micros() повертає час у мікросекундах.
-    const uint32_t loopStartUs = micros();
+void loop() {
 
-    // ==========================================
-    // STATIC ЗМІННІ
-    // ==========================================
+  unsigned long nowMs = millis();
 
-    // static локальні змінні створюються один раз
-    // і зберігають своє значення між
-    // викликами loop().
 
-    // Поточний режим LED
-    static LedMode mode = LedMode::Blinking;
+  // ==================================================
+  // Чекаємо перед ON
+  // ==================================================
 
-    // Поточний стан LED під час blinking
-    static LedState blinkState = LedState::Off;
+  if (state == WAIT_BEFORE_ON) {
 
-    // Час останнього перемикання LED
-    static uint32_t lastBlinkMs = 0;
+    if (nowMs - stateStartMs >= PAUSE_MS) {
 
-    // Час останнього прийнятого натискання кнопки
-    static uint32_t lastButtonMs = 0;
+      edgeDetected = false;
 
-    // Час останнього виведення статистики
-    static uint32_t lastStatsMs = 0;
+      commandStartUs = micros();
 
-    // Загальний час виконання loop()
-    // за поточний період
-    static uint64_t totalLoopTimeUs = 0;
+      digitalWrite(RELAY_CONTROL_PIN, RELAY_ON);
 
-    // Кількість виконаних ітерацій loop()
-    static uint32_t loopCounter = 0;
+      stateStartMs = nowMs;
+      state = WAIT_FOR_ON;
+    }
+  }
 
-    // ==========================================
-    // ПОТОЧНИЙ ЧАС
-    // ==========================================
 
-    const uint32_t currentMs = millis();
+  // ==================================================
+  // Чекаємо ON
+  // ==================================================
 
-    // Отримуємо LED
-    Led &led = getLed();
+  else if (state == WAIT_FOR_ON) {
 
-    // ==========================================
-    // 1. ОБРОБКА КНОПКИ
-    // ==========================================
+    unsigned long edgeTime;
 
-    // Якщо ISR зафіксував натискання
-    if (buttonPressed)
-    {
-        // Забираємо подію
-        buttonPressed = false;
+    if (contactReady(LOW, edgeTime)) {
 
-        // ======================================
-        // DEBOUNCE
-        // ======================================
+      onTime = edgeTime - commandStartUs;
 
-        // Перевіряємо, чи минуло достатньо часу
-        // від попереднього прийнятого натискання.
-        if (currentMs - lastButtonMs >= Config::DEBOUNCE_MS)
-        {
-            lastButtonMs = currentMs;
-
-            // ==================================
-            // ЗМІНА РЕЖИМУ
-            // ==================================
-
-            switch (mode)
-            {
-                // ----------------------------------
-                // BLINKING -> ALWAYS ON
-                // ----------------------------------
-
-                case LedMode::Blinking:
-                {
-                    mode = LedMode::AlwaysOn;
-
-                    led.set(LedState::On);
-
-                    Serial.println();
-                    Serial.println("Button pressed");
-                    Serial.println("Mode: ALWAYS ON");
-
-                    break;
-                }
-
-                // ----------------------------------
-                // ALWAYS ON -> ALWAYS OFF
-                // ----------------------------------
-
-                case LedMode::AlwaysOn:
-                {
-                    mode = LedMode::AlwaysOff;
-
-                    led.set(LedState::Off);
-
-                    Serial.println();
-                    Serial.println("Button pressed");
-                    Serial.println("Mode: ALWAYS OFF");
-
-                    break;
-                }
-
-                // ----------------------------------
-                // ALWAYS OFF -> BLINKING
-                // ----------------------------------
-
-                case LedMode::AlwaysOff:
-                {
-                    mode = LedMode::Blinking;
-
-                    // Починаємо блимання зі стану OFF
-                    blinkState = LedState::Off;
-
-                    led.set(blinkState);
-
-                    // Запам'ятовуємо час початку
-                    // нового циклу blinking
-                    lastBlinkMs = currentMs;
-
-                    Serial.println();
-                    Serial.println("Button pressed");
-                    Serial.println("Mode: BLINKING");
-
-                    break;
-                }
-            }
-        }
+      stateStartMs = nowMs;
+      state = WAIT_BEFORE_OFF;
     }
 
-    // ==========================================
-    // 2. КЕРУВАННЯ LED
-    // ==========================================
+    // Захист від зависання
+    else if (nowMs - stateStartMs >= TIMEOUT_MS) {
 
-    // delay() НЕ використовується.
-    //
-    // loop() постійно виконується,
-    // а ми тільки перевіряємо,
-    // чи пройшов необхідний час.
+      Serial.println("ON TIMEOUT");
 
-    if (mode == LedMode::Blinking)
-    {
-        // Перевіряємо, чи пройшло 500 мс
-        if (currentMs - lastBlinkMs >= Config::BLINK_INTERVAL_MS)
-        {
-            // Запам'ятовуємо час
-            lastBlinkMs = currentMs;
+      stateStartMs = nowMs;
+      state = WAIT_BEFORE_OFF;
+    }
+  }
 
-            // Перемикаємо стан LED
-            if (blinkState == LedState::Off)
-            {
-                blinkState = LedState::On;
-            }
-            else
-            {
-                blinkState = LedState::Off;
-            }
 
-            // Встановлюємо новий стан
-            led.set(blinkState);
-        }
+  // ==================================================
+  // Чекаємо перед OFF
+  // ==================================================
+
+  else if (state == WAIT_BEFORE_OFF) {
+
+    if (nowMs - stateStartMs >= PAUSE_MS) {
+
+      edgeDetected = false;
+
+      commandStartUs = micros();
+
+      digitalWrite(RELAY_CONTROL_PIN, RELAY_OFF);
+
+      stateStartMs = nowMs;
+      state = WAIT_FOR_OFF;
+    }
+  }
+
+
+  // ==================================================
+  // Чекаємо OFF
+  // ==================================================
+
+  else if (state == WAIT_FOR_OFF) {
+
+    unsigned long edgeTime;
+
+    if (contactReady(HIGH, edgeTime)) {
+
+      unsigned long offTime =
+        edgeTime - commandStartUs;
+
+      measurementCount++;
+
+      totalOnTime += onTime;
+      totalOffTime += offTime;
+
+
+      double avgOn =
+        (double)totalOnTime / measurementCount;
+
+      double avgOff =
+        (double)totalOffTime / measurementCount;
+
+
+      Serial.print("#");
+      Serial.print(measurementCount);
+
+      Serial.print(" | ON: ");
+      Serial.print(onTime);
+      Serial.print(" us");
+
+      Serial.print(" | OFF: ");
+      Serial.print(offTime);
+      Serial.print(" us");
+
+      Serial.print(" | AVG ON: ");
+      Serial.print(avgOn, 1);
+
+      Serial.print(" us | AVG OFF: ");
+      Serial.print(avgOff, 1);
+
+      Serial.println(" us");
+
+
+      stateStartMs = nowMs;
+      state = WAIT_BEFORE_ON;
     }
 
-    // ==========================================
-    // 3. КІНЕЦЬ ВИМІРЮВАННЯ SUPERLOOP
-    // ==========================================
+    // Захист від зависання
+    else if (nowMs - stateStartMs >= TIMEOUT_MS) {
 
-    const uint32_t loopEndUs = micros();
+      Serial.println("OFF TIMEOUT");
 
-    // Час виконання однієї ітерації loop()
-    const uint32_t loopTimeUs =
-        loopEndUs - loopStartUs;
-
-    // Додаємо результат до загального часу
-    totalLoopTimeUs += loopTimeUs;
-
-    // Збільшуємо кількість ітерацій
-    loopCounter++;
-
-    // ==========================================
-    // 4. СТАТИСТИКА SUPERLOOP
-    // ==========================================
-
-    // Виводимо статистику тільки раз на 2 секунди,
-    // щоб Serial Monitor не був завалений логами.
-    if (currentMs - lastStatsMs >= Config::STATS_INTERVAL_MS)
-    {
-        lastStatsMs = currentMs;
-
-        // Рахуємо середній час loop()
-        const float averageLoopTimeUs =
-            static_cast<float>(totalLoopTimeUs) /
-            static_cast<float>(loopCounter);
-
-        Serial.printf(
-            "Loop: avg %.2f us | iterations: %u\n",
-            averageLoopTimeUs,
-            loopCounter);
-
-        // Обнуляємо статистику
-        // і починаємо новий період вимірювання
-        totalLoopTimeUs = 0;
-        loopCounter = 0;
+      stateStartMs = nowMs;
+      state = WAIT_BEFORE_ON;
     }
+  }
 }
